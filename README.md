@@ -175,6 +175,10 @@ These are deliberate gaps, and several are targets for later hardening work:
 - `/metrics` is unauthenticated and should be restricted in any real deployment.
 - Tables are created at startup. A real deployment would use migrations (for example Alembic).
 
+## What broke
+
+Problems I hit while building and testing this project are logged in [BROKEN.md](BROKEN.md): the symptom, how I found the cause, the fix, and the lesson. It includes wrong guesses and questions that are still open.
+
 ## Project structure
 
 ```text
@@ -195,6 +199,7 @@ wallet-app/
 │   └── test_bot.py
 ├── .env.example
 ├── .gitignore
+├── BROKEN.md            # log of real problems I hit and how I fixed them
 ├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
