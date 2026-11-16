@@ -4,6 +4,21 @@ A log of real problems I hit while building and testing this project. Newest fir
 
 ---
 
+## 2026-11-17: Container exits immediately as non-root (`PermissionError: /app/data`)
+
+This one was a deliberate drill, not an accident. I had a working non-root Dockerfile and removed the `mkdir`/`chown` line on purpose to see the failure and learn to diagnose it.
+
+- **Symptom:** `docker ps -a` showed the container as `Exited (1)` about one second after it started. Exit code 1 (confirmed with `docker inspect`). `/health` never had a chance to answer.
+- **How I found the cause:** `docker logs` showed a long traceback. The last line names the error: `PermissionError: [Errno 13] Permission denied: '/app/data'`. Reading upward, the first path in my own code was `/app/app/database.py`, line 22, the `os.makedirs(...)` call. Everything above it is uvicorn and importlib internals. To prove the cause I ran two throwaway containers that override the start command:
+  - `docker run --rm wallet-app:broken ls -ld /app` printed `drwxr-xr-x ... root root /app`
+  - `docker run --rm wallet-app:broken id` printed `uid=10001(appuser) gid=10001(appuser)`
+- **Root cause:** `WORKDIR /app` creates the folder owned by root with mode `755`, so only root can write to it. The app runs as `appuser` (uid 10001), which counts as "other" and has no write permission. `database.py` creates `data/` for the SQLite file at import time, so the app crashed during import, before uvicorn could start listening (which is why the logs have no "Uvicorn running" line).
+- **Fix:** add `RUN mkdir -p /app/data && chown -R appuser:appuser /app/data` before the `USER appuser` line. It must come before `USER`, because after the switch `appuser` is not allowed to change ownership of anything. I only chown `data/`, not all of `/app`, so the app code stays read-only to the app.
+- **Check after the fix:** `/health` returns `{"status":"ok"}`, `whoami` prints `appuser`, `id` shows uid 10001, and `touch /app/app/text.txt` fails with `Permission denied`, so a compromised process could not modify the code.
+- **Lesson:** read a traceback from the bottom (the error) and then find the first line that is my own code. Running as non-root means every path the app writes to must be made writable on purpose. The same class of problem comes back with mounted volumes in Docker Compose.
+
+---
+
 ## 2026-11-14: Random 401 errors in the test suite (clock skew)
 
 - **Symptom:** about 4 in 10 full test runs failed (7 of 17), always with `401 Unauthorized` on a token that had just been issued. A different test failed each time.
@@ -65,6 +80,7 @@ A log of real problems I hit while building and testing this project. Newest fir
 ## Still open
 
 - **Cause of the slowdown at 50 bot users is not measured.** Candidates are password hashing (CPU), SQLite allowing only one writer at a time, or the bot and server sharing one laptop. Plan: compare average latency per endpoint from `/metrics`, and re-test on Postgres.
-- **The Postgres code path has not been run against a real Postgres yet.**
+- **The Postgres code path has not been run against a real Postgres yet.** In Docker Compose, check volume permissions for the database container.
 - **Why the WSL clock steps backwards is not investigated.** The app now tolerates it.
 - **`StarletteDeprecationWarning` about `httpx` in the test client:** harmless for now, and Starlette is not pinned in `requirements.txt`.
+- **Docker image size:** the single-stage, non-root image measured 318 MB on disk (74.7 MB compressed). The multi-stage version is not built or measured yet..
