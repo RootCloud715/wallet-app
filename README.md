@@ -16,6 +16,7 @@ It is a practice project for DevOps and DevSecOps: the app is intentionally smal
 - **Books check:** the bot can verify that total money held equals total money minted
 - **Operations:** liveness and readiness endpoints, Prometheus metrics, and opt-in failure injection
 - **Container image:** multi-stage build that runs as a non-root user
+- **Docker Compose stack:** the app and Postgres 16 with a health check and a persistent volume, started with one command
 - **Tests:** a pytest suite that includes a race-condition test and a full bot run, with no server needed
 
 ## Quick start
@@ -84,9 +85,59 @@ docker rm -f wallet                       # stop and remove
 Notes:
 
 - The app listens on `0.0.0.0` inside the container so that the published port (`-p`) can reach it.
-- Only `app/data` is writable by the app user. With the default SQLite database, the data file lives inside the container and is lost when the container is removed. Docker Compose with Postgres and a volume is the next roadmap item.
+- Only `app/data` is writable by the app user. Run on its own like this, the app uses its default SQLite database, and the data file lives inside the container and is lost when the container is removed. Use the Compose stack below for data that survives.
 - `.dockerignore` keeps `.venv`, `data`, `.env`, and `.git` out of the image.
 - Image size, measured with `docker images`: the single-stage non-root version was 318 MB on disk (74.7 MB compressed), and the multi-stage version is 322 MB (75.2 MB). This project has no compiler-heavy dependencies, so multi-stage does not shrink it. See `BROKEN.md` for the open question.
+
+## Run with Docker Compose (app + Postgres)
+
+The `docker-compose.yml` file starts two services:
+
+- **`db`:** Postgres 16 with a health check (`pg_isready`) and a named volume, `pgdata`, so data survives restarts. Its port is not published, so only the app can reach it.
+- **`app`:** built from the `Dockerfile` and published on port 8000. It starts only after the database reports healthy, and Compose sets its `DATABASE_URL` to point at the `db` service.
+
+Setup:
+
+```bash
+cp .env.example .env
+# edit .env: set JWT_SECRET, ADMIN_KEY and the three POSTGRES_* values
+# (letters and digits only in the password, so the connection URL needs no encoding)
+docker compose up --build
+```
+
+Never commit the real `.env`. It is listed in `.gitignore` and `.dockerignore`.
+
+Check it, from a second terminal:
+
+```bash
+docker compose ps                    # both services up, db shows (healthy)
+curl localhost:8000/health           # {"status":"ok"}
+docker compose exec app whoami       # appuser
+docker compose exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c '\dt'   # users and transactions tables
+```
+
+Run the bot against it. Export the admin key first (this prints nothing), otherwise the bot silently skips the books check:
+
+```bash
+export ADMIN_KEY=$(grep '^ADMIN_KEY=' .env | cut -d= -f2-)
+python bot/bot.py --users 20 --duration 60 --base-url http://localhost:8000
+```
+
+A healthy run ends with `Books: minted ... cents, held ... cents -> BALANCED`.
+
+Stopping:
+
+```bash
+docker compose down        # stops the stack, keeps the data volume
+docker compose down -v     # also deletes the volume, so all data is lost
+```
+
+What has been verified on this stack (Postgres 16, 20 bot users):
+
+- Both runs of 120 seconds and one of 60 seconds finished with no server errors, and the books balanced at the end.
+- The row-locking code ran under concurrent transfers without deadlocks.
+- The user count was identical before and after `docker compose down` and `up -d`.
+- Throughput was about 52 requests per second with p95 around 350 ms, slower than the earlier SQLite figures (about 80 per second, p95 156 ms). This is not a controlled comparison and the cause is not measured yet; see `BROKEN.md`.
 
 ## Configuration
 
@@ -96,9 +147,12 @@ All settings are environment variables. Copy `.env.example` to `.env` for local 
 |---|---|---|---|
 | `JWT_SECRET` | Yes | none | Signs login tokens. Random string, 32+ characters. Secret. |
 | `ADMIN_KEY` | No | unset | Enables `/admin/*` endpoints. Without it they return 404. Secret. |
-| `DATABASE_URL` | No | `sqlite:///./data/wallet.db` | Database connection. Use a `postgresql://` URL for Postgres. |
+| `DATABASE_URL` | No | `sqlite:///./data/wallet.db` | Database connection. Use a `postgresql://` URL for Postgres. Docker Compose sets this itself, so leave it out of `.env` when using Compose. |
 | `ENABLE_CHAOS` | No | `false` | Allows the failure-injection switches. Never enable in production. |
 | `SIGNUP_BONUS_CENTS` | No | `100000` | Mock balance given at signup (100000 = 1,000.00). |
+| `POSTGRES_USER` | Compose only | none | Database user created by the Postgres container. |
+| `POSTGRES_PASSWORD` | Compose only | none | Password for that user. Secret. |
+| `POSTGRES_DB` | Compose only | none | Name of the database created at first start. |
 
 ## API
 
@@ -160,7 +214,7 @@ With `ADMIN_KEY` set in the bot's environment, it ends with a line like:
 Books: minted 800000 cents, held 800000 cents -> BALANCED
 ```
 
-`BALANCED` means every transfer was atomic. `MISMATCH` means the app has a bug.
+`BALANCED` means every transfer was atomic. `MISMATCH` means the app has a bug. If no `Books:` line appears at all, the check did not run: the bot only checks the books when it has an admin key.
 
 ## Tests
 
@@ -168,7 +222,7 @@ Books: minted 800000 cents, held 800000 cents -> BALANCED
 pytest -q
 ```
 
-The suite covers registration and login, password hashing, forged, expired, and unsigned tokens, transfer rules, idempotent retries, concurrent transfers that must not overdraw a wallet, history privacy and pagination, admin access, failure injection, and a complete bot run whose books must balance. It uses a throwaway database and its own secrets, so no environment setup is needed.
+The suite covers registration and login, password hashing, forged, expired, and unsigned tokens, transfer rules, idempotent retries, concurrent transfers that must not overdraw a wallet, history privacy and pagination, admin access, failure injection, and a complete bot run whose books must balance. It uses a throwaway SQLite database and its own secrets, so no environment setup is needed. The tests do not run against Postgres; that path was checked with the bot on the Compose stack.
 
 ## Observability
 
@@ -198,16 +252,18 @@ curl -X POST localhost:8000/admin/chaos -H "X-Admin-Key: $ADMIN_KEY" \
 - **Tokens** are signed with a pinned algorithm, require an expiry, and reject unsigned or forged tokens.
 - **Fail fast.** The app will not start with a missing or short `JWT_SECRET`.
 - **Admin surface is opt-in.** Without `ADMIN_KEY`, admin routes return 404; with it, the key is compared in constant time.
-- **Postgres row locking.** On Postgres, both wallets are locked in a fixed order so opposite transfers cannot deadlock. SQLite needs no row locks because it serializes writers.
+- **Postgres row locking.** On Postgres, both wallets are locked in a fixed order so opposite transfers cannot deadlock. SQLite needs no row locks because it serializes writers. This path ran under concurrent bot load in the Compose stack and the books balanced.
 - **Least privilege in the container.** The image runs as a non-root user, the application code is read-only to that user, and only the data folder is writable.
+- **Database chosen by one variable.** The app reads only `DATABASE_URL`. Compose overrides it with a URL that points at the `db` service, so a value left in `.env` cannot silently send the app back to SQLite.
 
 ## Known limitations
 
 These are deliberate gaps, and several are targets for later hardening work:
 
-- Only tested against SQLite so far. The Postgres code path is written but not yet verified against a real Postgres.
+- Postgres is supported and verified in Docker Compose with 20 bot users, but the pytest suite still runs on SQLite, and the 50-user load test has not been run on Postgres.
+- Postgres in Compose is slower than SQLite at 20 users (p95 about 350 ms against 156 ms). The cause is not measured yet.
 - SQLite allows one writer at a time, which limits write throughput under heavy load.
-- In the container, the default SQLite file is lost when the container is removed.
+- When run without Compose, the default SQLite file is lost when the container is removed.
 - No rate limiting or lockout on login attempts.
 - No token revocation or refresh tokens.
 - No HTTPS in the app itself; TLS is expected to be terminated in front of it.
@@ -240,6 +296,7 @@ wallet-app/
 ├── .env.example
 ├── .gitignore
 ├── BROKEN.md            # log of real problems I hit and how I fixed them
+├── docker-compose.yml   # app + Postgres, health check, persistent volume
 ├── Dockerfile           # multi-stage build, non-root user
 ├── pytest.ini
 ├── requirements.txt
@@ -247,13 +304,4 @@ wallet-app/
 └── README.md
 ```
 
-## Roadmap
 
-- [x] Container image (multi-stage, non-root)
-- [ ] Docker Compose with Postgres
-- [ ] CI pipeline: lint, test, build, and publish an image on every push
-- [ ] Infrastructure as code (Terraform on AWS)
-- [ ] Kubernetes deployment with GitOps
-- [ ] Monitoring: Prometheus, Grafana, Loki, alerts, and an SLO
-- [ ] Security scanning in the pipeline: secrets, code, dependencies, images, IaC, signing
-- [ ] Incident drill with a runbook and postmortem
