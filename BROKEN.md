@@ -4,6 +4,48 @@ A log of real problems I hit while building and testing this project. Newest fir
 
 ---
 
+## 2026-11-24: CI failed with `pytest: command not found` (exit code 127)
+
+- **Symptom:** the `test` job went red in about 10 seconds at the `Run pytest` step. The log said `pytest: command not found` and `Process completed with exit code 127`. The earlier steps (checkout, Python setup, `pip install`) had all passed.
+- **Root cause:** a CI runner starts empty and gets only what the workflow installs. My workflow ran `pip install -r requirements.txt`, but pytest is a test-only dependency that lives in `requirements-dev.txt`. On my laptop the venv already had it, so the problem was invisible locally.
+- **Fix:** added a step that also installs `requirements-dev.txt` before `pytest`. Keeping test tools out of `requirements.txt` is deliberate, because the Docker image installs `requirements.txt` and should not ship pytest. After the fix, `test` passed in 47 seconds.
+- **Lesson:** exit code 127 means "command not found", which points at the environment, not at the code. "Works on my machine" usually means my machine has something the pipeline was never told to install. A pipeline that starts from a blank machine is a reproducibility test.
+
+---
+
+## 2026-11-24: CI failed at `setup-python`: Python 3.13.1 not found on Ubuntu 26.04
+
+- **Symptom:** the first real run of `test` failed after 6 seconds. That was too fast for installing dependencies, which pointed at the setup steps. The log of `actions/setup-python` said: `The version '3.13.1' with architecture 'x64' was not found for Ubuntu 26.04`.
+- **Root cause:** `ubuntu-latest` now resolves to Ubuntu 26.04, and `setup-python` can only install versions that GitHub has built for that image. The exact patch `3.13.1` is not in that list. My Dockerfile pins `3.13.1`, and I had copied the same number into the workflow, but the two systems get Python from different places: Docker Hub for the image, and the runner's prebuilt list for CI.
+- **Fix:** changed the workflow to `python-version: "3.13"`, which takes the newest 3.13 patch available on the runner. The Dockerfile keeps its exact pin. The only mismatch is that pytest in CI runs on a slightly newer patch than the image, which is harmless here.
+- **Also learned:** my first draft had `3.13.1-slim` in this field. `-slim` is a Docker image tag, not a Python version, so it would have failed even with the right OS. Quote the version in YAML, because an unquoted `3.10` is read as the number `3.1`.
+- **Lesson:** a 6-second failure is a setup failure. Read the first red step, not the last. Do not assume that a version pinned in one place exists in another. Also, `ubuntu-latest` is a moving target, so the runner image can change under a pipeline that did not change.
+
+---
+
+## 2026-11-24: First push of the workflow was rejected (token missing `workflow` scope)
+
+- **Symptom:** `git push -u origin add-ci` ended with `[remote rejected] ... refusing to allow a Personal Access Token to create or update workflow .github/workflows/ci.yml without workflow scope`. The commit itself was fine and was saved locally.
+- **Root cause:** GitHub treats workflow files as special, because a token that can edit them can make GitHub run arbitrary code in the repository. A personal access token needs the `workflow` permission (classic token) or **Workflows: Read and write** (fine-grained token) before it can push anything under `.github/workflows/`. My token had repository access but not that.
+- **Fix:** added the workflow permission to the token in GitHub's developer settings and pushed again. The commit did not need to be redone.
+- **Lesson:** a rejected push does not mean the commit is lost. Read the remote message: it named the exact missing permission. Tokens should have only the permissions they need, so the extra scope was a deliberate, narrow addition. The token string never goes into chat, files, or the repo.
+
+---
+
+## 2026-11-24: Mistakes in my first CI workflow drafts (caught in review before they ran)
+
+None of these reached GitHub, but they are the mistakes a beginner is likely to make, so I am keeping them.
+
+- **Missing versions:** `uses: actions/checkout` with no `@version`. Every action needs a version, and pinning it is a supply-chain control.
+- **Typos that fail silently or late:** `requirement.txt` for `requirements.txt`, and `JWT_SECRETS` for `JWT_SECRET`. The second one would not crash anything. The app would just never see the variable, and the tests would fail later with a confusing error. Names must match exactly what the code reads, so I checked them with `grep`.
+- **Structure errors in the publish job:** the job name was missing or at the wrong indent, `needs` and `if` sat at different depths, the actions were written as keys (`docker/login-action:`) instead of steps (`- uses: docker/login-action@...` with a `with:` block), and `runs-on` and a checkout step were missing.
+- **Wrong key:** `content: read` instead of `contents: read`.
+- **YAML syntax:** a stray colon after `docker/build-push-action@v7:` and `push: true` indented five spaces instead of ten. YAML indentation is the structure, and tabs are not allowed.
+- **Real values in a public file:** the `<owner>` placeholder had to become my lowercase username, and secrets must never be pasted into a workflow file. The values in the `test` step are throwaway strings that only let the tests start.
+- **Lesson:** read the workflow top to bottom as a machine would, and check the structure before checking the logic. Reading the log of a failed run is faster than guessing, but a careful read before pushing saves a round trip.
+
+---
+
 ## 2026-11-22: Postgres in Compose is slower than SQLite (cause not measured)
 
 This is a finding rather than a crash, and I do not know the cause yet.
@@ -136,7 +178,8 @@ This one was a deliberate drill, not an accident. I had a working non-root Docke
 - **Cause of the slowdown at 50 bot users is not measured, and the 50-user test has not been run on Postgres yet.** Candidates are password hashing (CPU), SQLite allowing only one writer at a time, or the bot and server sharing one laptop. Postgres at 20 users is also slower than SQLite (see the 2026-11-22 entry), so these may share a cause. Plan: compare average latency per endpoint from `/metrics`, then run 50 users against Postgres.
 - **Why the WSL clock steps backwards is not investigated.** The app now tolerates it.
 - **`StarletteDeprecationWarning` about `httpx` in the test client:** harmless for now, and Starlette is not pinned in `requirements.txt`.
-- **Docker image size, multi-stage did not shrink it:** the single-stage non-root image is 318 MB on disk (74.7 MB compressed) and the multi-stage image is 322 MB (75.2 MB), about 4 MB larger. I predicted it would grow by about 50 MB, so I was off by roughly 12 times: stage 1 had almost nothing to throw away (a tiny `requirements.txt`, `--no-cache-dir`, and `psycopg[binary]` ships a prebuilt wheel, so no compiler). One likely cause is that `python -m venv` adds its own copy of pip (13 MB, measured with `du -sh`) on top of the one in the base image. That alone should have made it about 13 MB larger, not 4 MB, so the gap is not fully explained. Next step: compare `docker history` for both images layer by layer. Lesson: multi-stage pays off when the build stage needs compilers or headers that the runtime does not.
+- **Docker image size, multi-stage did not shrink it:** the single-stage non-root image is 318 MB on disk (74.7 MB compressed) and the multi-stage image is 322 MB (75.2 MB), about 4 MB larger. The image built by CI measures the same as my local build (322 MB, 75.2 MB), so the difference is not caused by my machine. I predicted it would grow by about 50 MB, so I was off by roughly 12 times: stage 1 had almost nothing to throw away (a tiny `requirements.txt`, `--no-cache-dir`, and `psycopg[binary]` ships a prebuilt wheel, so no compiler). One likely cause is that `python -m venv` adds its own copy of pip (13 MB, measured with `du -sh`) on top of the one in the base image. That alone should have made it about 13 MB larger, not 4 MB, so the gap is not fully explained. Next step: compare `docker history` for both images layer by layer. Lesson: multi-stage pays off when the build stage needs compilers or headers that the runtime does not.
+- **GitHub Actions are pinned by major version tag (for example `@v7`), not by commit SHA.** A tag can be moved by the action's author, so pinning each action to a full commit SHA, with the version in a comment, is the stricter option. Planned as a later hardening step.
 
 ## Resolved from this list
 
