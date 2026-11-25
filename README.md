@@ -322,7 +322,7 @@ wallet-app/
 │   └── main.py          # API routes, metrics, failure injection
 ├── bot/
 │   ├── __init__.py
-│   └── bot.py           # simulated users
+│   └── bot.py           # simulated users used for filling up database 
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
