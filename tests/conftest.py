@@ -1,14 +1,10 @@
+import itertools
 import os
 import tempfile
-import itertools  # noqa: E402
 
-import pytest  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+import pytest
 
-from app.main import app, chaos_state  # noqa: E402
-
-
-# Set before the app is imported so tests use a throwaway database and known secrets.
+# Must run before anything from `app` is imported: app/db.py reads DATABASE_URL at import time.
 _tmp = tempfile.mkdtemp(prefix="wallet-test-")
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmp}/test.db"
 os.environ["JWT_SECRET"] = "test-secret-test-secret-test-secret-123456"
@@ -16,6 +12,13 @@ os.environ["ADMIN_KEY"] = "test-admin-key"
 os.environ["SIGNUP_BONUS_CENTS"] = "100000"
 os.environ.pop("ENABLE_CHAOS", None)
 
+from fastapi.testclient import TestClient  # noqa: E402
+from app.database import DATABASE_URL  # noqa: E402
+from app.main import app, chaos_state  # noqa: E402
+
+# Guard: refuse to run if the app is not on the throwaway database.
+if "wallet-test-" not in DATABASE_URL:
+    raise RuntimeError(f"Tests are pointed at a real database: {DATABASE_URL.split('@')[-1]}")
 
 ADMIN = {"X-Admin-Key": "test-admin-key"}
 _counter = itertools.count(1)
