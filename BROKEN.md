@@ -4,6 +4,16 @@ A log of real problems I hit while building and testing this project. Newest fir
 
 ---
 
+## 2026-11-28: Root container drill (deliberate, nothing crashed)
+
+This was a drill. I commented out `USER appuser` in the Dockerfile, rebuilt, and compared the two images.
+
+- **Symptom:** none, and that is the point. With the line removed the app builds and starts exactly as before. Nothing warns that it now runs as root.
+- **Evidence without the line:** `docker run --rm wallet-app:root-drill whoami` printed `root`, `id` showed `uid=0(root)`, and `touch /app/app/x.txt` succeeded, so the process could modify its own code.
+- **Fix:** restored `USER appuser` (line 19). Rebuilt, then `whoami` printed `appuser`, `id` showed `uid=10001`, `touch /app/app/x.txt` failed with `Permission denied`, and `/health` still returned `{"status":"ok"}`.
+- **Why it matters:** if an attacker breaks into a process running as root in a container, they hold root inside it, can change the app's code, and have a much better start at escaping to the host. As `appuser` they can write only to `/app/data`.
+- **Lesson:** a missing security control produces no error. The only way to know a container is non-root is to check with `whoami` or `id`. This is why the checks belong in the drill, and later in CI. Compare the 2026-11-17 entry: there the non-root user caused a crash, and the crash was the useful feedback.
+
 ## 2026-11-26: Branch protection drill passed in CI because the test file was never collected
 
 This was a deliberate drill: a test that must fail, to prove a bad pull request cannot merge.
