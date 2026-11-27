@@ -4,6 +4,39 @@ A log of real problems I hit while building and testing this project. Newest fir
 
 ---
 
+## 2026-11-26: Branch protection drill passed in CI because the test file was never collected
+
+This was a deliberate drill: a test that must fail, to prove a bad pull request cannot merge.
+
+- **Symptom:** I added a file with `assert 1 == 2`, opened a pull request, and CI went green. I expected red. `pytest -v` locally said `collected 23 items`, the same count as before the file existed.
+- **How I found the cause:** the count. 23 collected meant the new file was not part of the run. My `pytest.ini` has `testpaths = tests`, and pytest only collects files named `test_*.py` or `*_test.py`. My file was named `test-break-drill.py`, with hyphens, so pytest ignored it. The workflow itself was fine: it runs plain `pytest` with no `|| true`.
+- **Fix:** renamed it to `tests/test_break_drill.py`. Locally `pytest -v` then said `collected 24 items` with the new test `FAILED`. On GitHub the `CI / test` check failed with `1 failed, 23 passed`, `CI / publish` was skipped, and the **Merge pull request** button stayed disabled. I took a screenshot, closed the pull request without merging, and deleted the branch.
+- **Also checked:** a direct `git push origin main` is rejected by the ruleset, and a README-only pull request goes through once `CI / test` is green. So both the block and the normal path work.
+- **Lesson:** a test that is never collected passes silently, and a green check does not prove the tests ran. Check the collected count. A drill that does not fail the first time is also a finding: it showed my first attempt was wrong.
+
+---
+
+## 2026-11-26: Tests hit the real dev database again (15 failures with `409`)
+
+- **Symptom:** in WSL, 15 of 23 tests failed. The first one I ran alone failed in `make_user` with `assert 409 == 201` when registering `user_1`. The 8 tests that passed were the ones that never create a user (health, metrics, bad input, requests without a token, admin key, chaos off). In CI the same suite was green.
+- **How I found the cause:** a `409 Conflict` on the first user means that username already exists, so the database was not fresh. `conftest.py` sets `DATABASE_URL` to a temporary SQLite file, but `app/db.py` reads `DATABASE_URL` once, at import time, and builds the engine right then. In `conftest.py` the line `from app.main import app, chaos_state` sat above the block that sets the environment variables. The app was imported first, picked up the default `sqlite:///./data/wallet.db`, and the temporary URL was set too late.
+- **Root cause:** the same bug as the 2026-11-14 entry, back again. The `# noqa: E402` comments only make sense when every import is below the environment block, so something reordered the imports. An editor or a sort tool is the likely culprit, but I did not confirm which. CI hid it because a clean runner has no leftover data in `data/wallet.db`, so the early import did no harm there.
+- **Fix:** moved the `from fastapi.testclient ...` and `from app...` imports below the block that sets the temporary database and the test secrets. After that `pytest -v` gave 23 passed.
+- **Side effect to clean up:** earlier test runs wrote `user_1`, `user_2` and so on into the real dev database, so that file holds test users.
+- **Lesson:** import order can be configuration. A misconfiguration that silently touches real data should become a loud failure, and a green CI does not prove a clean local setup. Always compare the collected count and the first failure, not only the total.
+
+---
+
+## 2026-11-26: Branches got tangled: the fix branch carried the drill commit and a stray file
+
+- **Symptom:** I pushed what I thought was the conftest fix and the drill branch in the wrong order. GitHub showed `main`, `break-test`, and `fix-test-isolation`. The pull request from the fix branch contained a drill file and an empty `app.config.py`, and no `conftest.py` change.
+- **How I found the cause:** `git branch -vv` and `git log --oneline --graph --all --decorate` showed `fix-test-isolation` sitting on top of the drill commit `61df117`. I had created the fix branch while standing on the drill branch, so it inherited that commit. `git diff --stat main origin/fix-test-isolation` listed only the two stray files. The drill branch had never been pushed, and a leftover stash from an earlier `git stash` also existed.
+- **Root cause:** `git switch -c` starts from the branch you are on, not from `main`. I did not check where I was before creating the branch, and I probably used `git add .`, which picked up the empty file.
+- **Fix:** nothing had reached `main`, so I deleted every branch except `main` (locally and on GitHub) and started again. I created a new branch from an updated `main`, fixed `tests/conftest.py`, checked `pytest -v`, and pushed that as its own pull request. The drill got its own branch afterwards.
+- **Lesson:** run `git branch --show-current` before every `git switch -c`, and `git status` before every commit. Add files by name instead of `git add .`. One purpose per branch keeps pull requests honest. A stash is real work: look inside it before dropping it.
+
+---
+
 ## 2026-11-24: CI failed with `pytest: command not found` (exit code 127)
 
 - **Symptom:** the `test` job went red in about 10 seconds at the `Run pytest` step. The log said `pytest: command not found` and `Process completed with exit code 127`. The earlier steps (checkout, Python setup, `pip install`) had all passed.
@@ -175,6 +208,10 @@ This one was a deliberate drill, not an accident. I had a working non-root Docke
 
 ## Still open
 
+- **Intermittent `401` in `test_insufficient_funds` on my WSL machine (found 2026-11-26).** With the drill file present, one local run gave `2 failed, 22 passed`: the intentional failure and `test_insufficient_funds`, which got `401` where it expected `422`. The same suite passed on GitHub's runner (`1 failed, 23 passed`, the one failure being the drill), and it had passed locally minutes earlier. This looks like the WSL clock problem from 2026-11-14, but I have not confirmed it. Plan: run that single test in a loop, check `grep -n leeway app/security.py`, compare `date` in WSL with Windows, then run the full suite 5 times in a row.
+- **Python versions differ across places.** My WSL venv runs Python 3.12.3, the CI runner uses 3.13 (3.13.18 in the last log), and the Dockerfile pins 3.13.1. Tests pass on both 3.12 and 3.13, but it would be cleaner to run the same minor version everywhere.
+- **`CI / publish` is marked Required in the ruleset but is skipped on pull requests by design.** GitHub treats a skipped job as passing, so it does no harm today. Only `test` needs to be required, so I plan to untick `publish` in the ruleset.
+- **Test users were written into the real dev database** while the imports in `conftest.py` were in the wrong order (2026-11-26). The data is only dev and test data, but it should be cleaned up. Move the files out of the way instead of deleting them, and the app will recreate them.
 - **Cause of the slowdown at 50 bot users is not measured, and the 50-user test has not been run on Postgres yet.** Candidates are password hashing (CPU), SQLite allowing only one writer at a time, or the bot and server sharing one laptop. Postgres at 20 users is also slower than SQLite (see the 2026-11-22 entry), so these may share a cause. Plan: compare average latency per endpoint from `/metrics`, then run 50 users against Postgres.
 - **Why the WSL clock steps backwards is not investigated.** The app now tolerates it.
 - **`StarletteDeprecationWarning` about `httpx` in the test client:** harmless for now, and Starlette is not pinned in `requirements.txt`.
